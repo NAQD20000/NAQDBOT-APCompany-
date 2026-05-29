@@ -331,10 +331,5 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, filter_links))
     
     # اجرا با Webhook
-    PORT = int(os.environ.get('PORT', 8443))
-    application.run_webhook(
-        listen="0.0.0.0", 
-        port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
-    )
+        # اجرا با Polling (بدون نیاز به Webhook)
+    application.run_polling()
