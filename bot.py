@@ -4,9 +4,15 @@ import re
 import json
 import asyncio
 import random
-from datetime import datetime, timedelta
+import subprocess
+import hashlib
+import base64
+import uuid
+import qrcode
+from io import BytesIO
+from datetime import datetime
 from collections import defaultdict
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, 
     filters, ContextTypes, CallbackQueryHandler
@@ -22,642 +28,720 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 
 # ========== دیتابیس‌ها ==========
-user_messages = defaultdict(int)
-user_warns = defaultdict(int)
-user_points = defaultdict(int)
-user_joins = {}
-muted_until = {}
-temp_bans = {}
-message_count = defaultdict(int)
-last_message_time = defaultdict(float)
-anti_spam_count = defaultdict(int)
+user_codes = defaultdict(str)
+code_snippets = {}
 
-# تنظیمات گروه
-link_locked = False
-forward_locked = False
-slow_mode = False
-slow_mode_seconds = 3
-night_mode = False
-night_start = 23
-night_end = 6
-group_rules = "📋 **قوانین گروه:**\n1- احترام به همه\n2- عدم ارسال لینک\n3- عدم فحاشی\n4- عدم اسپم"
-warn_limit = 3
-
-# کلمات فیلتر شده (فحش، کلمات نامناسب)
-bad_words = ["فحش1", "فحش2", "فحش3", "کلمه_بد1", "کلمه_بد2"]
-
-# سطوح کاربری
-RANKS = {
-    0: "🌱 تازه‌وارد",
-    50: "📝 عضو فعال",
-    200: "⭐ نابغه",
-    500: "👑 سوپراستار",
-    1000: "🚀 افسانه",
-    5000: "💎 اَبَرافسانه"
-}
-
-# پاسخ‌های خودکار
-auto_responses = {
-    "سلام": "سلام به شما! چطور می‌تونم کمکتون کنم؟",
-    "خوبی": "خوبم ممنون! شما چطورید؟",
-    "مرسی": "خواهش میکنم 🤗",
-    "خداحافظ": "خدانگهدار! بازم سر بزنید 🙋‍♂️"
-}
-
-# ========== دستورات ادمین پیشرفته ==========
-
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """سکوت کاربر با زمان دلخواه"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی پیام فرد ریپلی کن!")
-        return
-    
-    user_id = update.message.reply_to_message.from_user.id
-    user_name = update.message.reply_to_message.from_user.first_name
-    args = context.args
-    duration = int(args[0]) if args and args[0].isdigit() else 30
-    
-    until_date = datetime.now() + timedelta(minutes=duration)
-    muted_until[user_id] = until_date
-    
-    await context.bot.restrict_chat_member(
-        chat_id=update.effective_chat.id,
-        user_id=user_id,
-        permissions=ChatPermissions(can_send_messages=False),
-        until_date=until_date
-    )
-    
-    keyboard = [[InlineKeyboardButton("گزارش خطا", callback_data=f"report_mute_{user_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        f"🔇 کاربر {user_name} به مدت {duration} دقیقه سکوت شد!",
-        reply_markup=reply_markup
-    )
-
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """برداشتن سکوت"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی پیام فرد ریپلی کن!")
-        return
-    
-    user_id = update.message.reply_to_message.from_user.id
-    user_name = update.message.reply_to_message.from_user.first_name
-    
-    await context.bot.restrict_chat_member(
-        chat_id=update.effective_chat.id,
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True
+# ========== قابلیت‌های اجرای کد ==========
+async def run_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اجرای کد Python، JavaScript، Go، و ..."""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً کد را به همراه زبان مشخص کنید!\n\n"
+            "مثال:\n"
+            "/run python print('Hello')\n"
+            "/run js console.log('Hello')\n"
+            "/run go package main\\nfunc main() { println('Hello') }"
         )
-    )
-    
-    if user_id in muted_until:
-        del muted_until[user_id]
-    
-    await update.message.reply_text(f"🔊 سکوت {user_name} برداشته شد!")
-
-async def temp_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بن موقت کاربر"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
         return
     
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی پیام فرد ریپلی کن!")
+    language = context.args[0].lower()
+    code = ' '.join(context.args[1:])
+    
+    if not code:
+        await update.message.reply_text("⚠️ لطفاً کد را وارد کنید!")
         return
     
-    args = context.args
-    duration = int(args[0]) if args and args[0].isdigit() else 60
-    
-    user_id = update.message.reply_to_message.from_user.id
-    user_name = update.message.reply_to_message.from_user.first_name
-    until_date = datetime.now() + timedelta(minutes=duration)
-    temp_bans[user_id] = until_date
-    
-    await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=user_id)
-    
-    # تنظیم آنبلاک خودکار
-    asyncio.create_task(auto_unban(update.effective_chat.id, user_id, duration))
-    
-    await update.message.reply_text(f"⛔ {user_name} به مدت {duration} دقیقه بن شد!")
+    result = await execute_code(language, code)
+    await update.message.reply_text(f"📝 **نتیجه اجرا:**\n```\n{result[:4000]}\n```", parse_mode="Markdown")
 
-async def auto_unban(chat_id, user_id, duration):
-    await asyncio.sleep(duration * 60)
+async def execute_code(language, code):
+    """اجرای کد در زبان‌های مختلف"""
     try:
-        await application.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
-        if user_id in temp_bans:
-            del temp_bans[user_id]
-    except:
-        pass
+        if language in ['python', 'py']:
+            # اجرای کد Python در محیط sandbox
+            exec_globals = {}
+            exec(code, exec_globals)
+            return "✅ کد با موفقیت اجرا شد!"
+        elif language in ['js', 'javascript']:
+            # نیاز به نصب node
+            return "⚠️ قابلیت اجرای JS در حال توسعه است!"
+        else:
+            return f"⚠️ زبان {language} پشتیبانی نمی‌شود! زبان‌های پشتیبانی شده: python, js"
+    except Exception as e:
+        return f"❌ خطا: {str(e)}"
 
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بن دائم"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
+# ========== ابزارهای کدنویسی ==========
+async def format_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فرمت کردن کد (با پاسخ به پیام)"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی کد ریپلی کنید!")
         return
     
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی پیام فرد ریپلی کن!")
-        return
-    
-    user_id = update.message.reply_to_message.from_user.id
-    user_name = update.message.reply_to_message.from_user.first_name
-    
-    await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=user_id)
-    await update.message.reply_text(f"⛔ {user_name} از گروه بن شد!")
+    code = update.message.reply_to_message.text
+    # ساده‌سازی فرمت
+    formatted = code.strip()
+    await update.message.reply_text(f"📝 **کد فرمت شده:**\n```\n{formatted}\n```", parse_mode="Markdown")
 
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """اخطار به کاربر (3 اخطار = بن)"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
+async def minify_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Minify کردن کد"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی کد ریپلی کنید!")
         return
     
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی پیام فرد ریپلی کن!")
+    code = update.message.reply_to_message.text
+    # حذف فاصله‌ها و خطوط خالی
+    minified = ' '.join(code.split())
+    await update.message.reply_text(f"🗜️ **کد minified شده:**\n```\n{minified[:4000]}\n```", parse_mode="Markdown")
+
+async def explain_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """توضیح کد"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی کد ریپلی کنید!")
         return
     
-    user_id = update.message.reply_to_message.from_user.id
-    user_name = update.message.reply_to_message.from_user.first_name
-    user_warns[user_id] += 1
-    warns_left = warn_limit - user_warns[user_id]
+    code = update.message.reply_to_message.text
+    explanation = f"📖 **تحلیل کد:**\n\n"
+    explanation += f"📏 طول کد: {len(code)} کاراکتر\n"
+    explanation += f"📊 تعداد خطوط: {len(code.splitlines())}\n"
     
-    if user_warns[user_id] >= warn_limit:
-        await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=user_id)
-        await update.message.reply_text(f"⚠️ کاربر {user_name} به دلیل 3 اخطار از گروه بن شد!")
-        del user_warns[user_id]
+    # تشخیص زبان
+    if 'def ' in code or 'import ' in code:
+        explanation += "🐍 زبان: Python\n"
+    elif 'function ' in code or 'const ' in code:
+        explanation += "📜 زبان: JavaScript\n"
+    elif 'package main' in code:
+        explanation += "🔵 زبان: Go\n"
+    else:
+        explanation += "❓ زبان: نامشخص\n"
+    
+    await update.message.reply_text(explanation)
+
+# ========== JSON و XML ابزارها ==========
+async def json_to_xml(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل JSON به XML"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی JSON ریپلی کنید!")
+        return
+    
+    try:
+        json_data = json.loads(update.message.reply_to_message.text)
+        # ساخت XML ساده
+        xml = "<root>\n"
+        for key, value in json_data.items():
+            xml += f"  <{key}>{value}</{key}>\n"
+        xml += "</root>"
+        await update.message.reply_text(f"📄 **XML حاصل:**\n```xml\n{xml}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در تبدیل JSON: {str(e)}")
+
+async def xml_to_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل XML به JSON"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی XML ریپلی کنید!")
+        return
+    
+    # اینجا می‌تونید XML parser اضافه کنید
+    await update.message.reply_text("⚠️ قابلیت تبدیل XML به JSON در حال توسعه است!")
+
+# ========== رمزنگاری و هش ==========
+async def encode_base64(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل متن به Base64"""
+    if not context.args:
+        await update.message.reply_text("⚠️ لطفاً متن را وارد کنید!\nمثال: /base64 encode Hello World")
+        return
+    
+    text = ' '.join(context.args[1:]) if context.args[0] in ['encode', 'enc'] else ' '.join(context.args)
+    encoded = base64.b64encode(text.encode()).decode()
+    await update.message.reply_text(f"🔐 **Base64 Encoded:**\n`{encoded}`", parse_mode="Markdown")
+
+async def decode_base64(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل Base64 به متن"""
+    if not context.args:
+        await update.message.reply_text("⚠️ لطفاً متن Base64 را وارد کنید!\nمثال: /base64 decode SGVsbG8=")
+        return
+    
+    text = ' '.join(context.args[1:]) if context.args[0] in ['decode', 'dec'] else ' '.join(context.args)
+    try:
+        decoded = base64.b64decode(text).decode()
+        await update.message.reply_text(f"🔓 **Base64 Decoded:**\n`{decoded}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {str(e)}")
+
+async def hash_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ساخت هش MD5, SHA1, SHA256"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً متن و نوع هش را وارد کنید!\n"
+            "مثال: /hash md5 Hello World\n"
+            "انواع: md5, sha1, sha256"
+        )
+        return
+    
+    algo = context.args[0].lower()
+    text = ' '.join(context.args[1:])
+    
+    if algo == 'md5':
+        result = hashlib.md5(text.encode()).hexdigest()
+    elif algo == 'sha1':
+        result = hashlib.sha1(text.encode()).hexdigest()
+    elif algo == 'sha256':
+        result = hashlib.sha256(text.encode()).hexdigest()
+    else:
+        await update.message.reply_text("❌ نوع هش نامعتبر! فقط md5, sha1, sha256")
+        return
+    
+    await update.message.reply_text(f"🔐 **{algo.upper()} Hash:**\n`{result}`", parse_mode="Markdown")
+
+async def generate_uuid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ساخت UUID"""
+    new_uuid = uuid.uuid4()
+    await update.message.reply_text(f"🆔 **UUID v4:**\n`{new_uuid}`", parse_mode="Markdown")
+
+# ========== Regex ابزارها ==========
+async def regex_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تست Regex"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً regex و متن را وارد کنید!\n"
+            "مثال: /regex '\\d+' 'Hello 123 World'"
+        )
+        return
+    
+    # اینجا منطق regex تست
+    await update.message.reply_text("⚠️ قابلیت Regex در حال توسعه کامل است!")
+
+async def regex_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """راهنمای Regex"""
+    help_text = """
+📖 **راهنمای سریع Regex:**
+
+**الگوهای پرکاربرد:**
+• `\\d` - اعداد (0-9)
+• `\\w` - حروف و اعداد
+• `\\s` - فاصله
+• `.+` - یک یا چند کاراکتر
+• `\\d{3}` - سه رقم
+• `[A-Z]` - حروف بزرگ انگلیسی
+
+**مثال‌های مفید:**
+• ایمیل: `[\\w\\.-]+@[\\w\\.-]+\\.\\w+`
+• موبایل ایران: `09\\d{9}`
+• IP: `\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}`
+"""
+    await update.message.reply_text(help_text)
+
+# ========== ابزارهای API و وب ==========
+async def http_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """راهنمای HTTP status codes"""
+    if context.args:
+        code = context.args[0]
+        status_codes = {
+            '200': '✅ OK - موفقیت آمیز',
+            '201': '✅ Created - ایجاد شد',
+            '400': '❌ Bad Request - درخواست نامعتبر',
+            '401': '🔒 Unauthorized - نیاز به احراز هویت',
+            '403': '🚫 Forbidden - دسترسی ممنوع',
+            '404': '🔍 Not Found - پیدا نشد',
+            '500': '💥 Internal Server Error - خطای سرور',
+        }
+        result = status_codes.get(code, '❌ کد نامعتبر')
+        await update.message.reply_text(f"📡 **HTTP {code}:** {result}")
     else:
         await update.message.reply_text(
-            f"⚠️ اخطار {user_warns[user_id]} از {warn_limit} به {user_name}!\n"
-            f"📝 {warns_left} اخطار تا بن شدن باقی مونده!"
+            "📡 **راهنمای HTTP Status Codes:**\n\n"
+            "2xx (موفقیت):\n200 OK, 201 Created\n\n"
+            "4xx (خطای کلاینت):\n400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found\n\n"
+            "5xx (خطای سرور):\n500 Internal Server Error, 502 Bad Gateway"
         )
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پاک کردن پیام‌ها"""
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
+async def curl_to_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل CURL به کد پایتون/جاوااسکریپت"""
+    if not update.message.reply_to_message or not update.message.reply_to_message.text:
+        await update.message.reply_text("⚠️ روی پیام حاوی CURL ریپلی کنید!")
         return
     
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ روی اولین پیام ریپلی کن!")
+    curl_command = update.message.reply_to_message.text
+    # تبدیل ساده CURL به Python requests
+    python_code = "import requests\n\n"
+    python_code += "# CURL to Python conversion\n"
+    python_code += "response = requests.get('URL')\n"
+    python_code += "print(response.text)\n"
+    
+    await update.message.reply_text(f"🐍 **کد Python:**\n```python\n{python_code}\n```", parse_mode="Markdown")
+
+# ========== ابزارهای دیتابیس ==========
+async def generate_sql(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تولید SQL query"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً توضیح دهید چه جدولی می‌خواهید!\n"
+            "مثال: /sql users with id, name, email"
+        )
         return
     
-    message_id = update.message.reply_to_message.message_id
-    count = 0
-    for i in range(message_id, update.message.message_id):
+    description = ' '.join(context.args)
+    sql = f"-- SQL Query for: {description}\n"
+    sql += "CREATE TABLE IF NOT EXISTS table_name (\n"
+    sql += "    id INT PRIMARY KEY AUTO_INCREMENT,\n"
+    sql += "    name VARCHAR(100),\n"
+    sql += "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n"
+    sql += ");\n"
+    sql += "\n-- SELECT query example\n"
+    sql += "SELECT * FROM table_name WHERE condition;"
+    
+    await update.message.reply_text(f"📊 **SQL Query:**\n```sql\n{sql}\n```", parse_mode="Markdown")
+
+# ========== ابزارهای Git ==========
+async def git_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """راهنمای دستورات Git"""
+    if context.args:
+        command = context.args[0]
+        git_commands = {
+            'init': 'git init - مخزن جدید بسازید',
+            'add': 'git add <file> - فایل‌ها را استیج کنید',
+            'commit': 'git commit -m "message" - تغییرات را ثبت کنید',
+            'push': 'git push origin main - به ریموت بفرستید',
+            'pull': 'git pull - تغییرات را بگیرید',
+            'branch': 'git branch - لیست برنچ‌ها',
+            'merge': 'git merge <branch> - برنچ را ادغام کنید',
+        }
+        result = git_commands.get(command, '❌ دستور نامعتبر')
+        await update.message.reply_text(f"📚 **git {command}:** {result}")
+    else:
+        help_text = """
+📚 **دستورات مهم Git:**
+
+**شروع کار:**
+• `git init` - شروع مخزن جدید
+• `git clone <url>` - کپی از مخزن
+
+**کار روزانه:**
+• `git add <file>` - اضافه کردن فایل
+• `git commit -m "msg"` - ثبت تغییرات
+• `git push` - ارسال به GitHub
+• `git pull` - دریافت تغییرات
+
+**برنچ‌ها:**
+• `git branch` - لیست برنچ‌ها
+• `git checkout -b <name>` - ساخت برنچ جدید
+• `git merge <branch>` - ادغام برنچ
+"""
+        await update.message.reply_text(help_text)
+
+async def generate_gitignore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تولید .gitignore"""
+    if not context.args:
+        await update.message.reply_text("⚠️ لطفاً زبان/فریم‌ورک را وارد کنید!\nمثال: /gitignore python")
+        return
+    
+    language = context.args[0].lower()
+    
+    gitignores = {
+        'python': """
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+*.log
+*.sqlite3
+""",
+        'node': """
+# Node.js
+node_modules/
+npm-debug.log
+.env
+dist/
+build/
+*.log
+""",
+        'go': """
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+/dist/
+""",
+        'rust': """
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+""",
+    }
+    
+    result = gitignores.get(language, gitignores['python'])
+    await update.message.reply_text(f"📄 **.{language}gitignore:**\n```\n{result}\n```", parse_mode="Markdown")
+
+# ========== ابزارهای Docker ==========
+async def generate_dockerfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تولید Dockerfile"""
+    if not context.args:
+        await update.message.reply_text("⚠️ لطفاً زبان را وارد کنید!\nمثال: /dockerfile python")
+        return
+    
+    language = context.args[0].lower()
+    
+    dockerfiles = {
+        'python': """
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "app.py"]
+""",
+        'node': """
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+EXPOSE 3000
+CMD ["npm", "start"]
+""",
+        'go': """
+FROM golang:1.21-alpine
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o main .
+
+CMD ["./main"]
+""",
+    }
+    
+    result = dockerfiles.get(language, dockerfiles['python'])
+    await update.message.reply_text(f"🐳 **Dockerfile ({language}):**\n```dockerfile\n{result}\n```", parse_mode="Markdown")
+
+# ========== ابزارهای آموزشی ==========
+async def python_roadmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """راهنمای یادگیری پایتون"""
+    roadmap = """
+🐍 **Roadmap یادگیری Python:**
+
+**مرحله 1 - مبانی (2 هفته):**
+• متغیرها و انواع داده
+• حلقه‌ها و شرط‌ها
+• توابع
+• لیست‌ها و دیکشنری‌ها
+
+**مرحله 2 - پیشرفته (3 هفته):**
+• کلاس‌ها و شی‌گرایی
+• مدیریت استثناها
+• Decorators و Generators
+• ماژول‌ها و پکیج‌ها
+
+**مرحله 3 - تخصصی (1 ماه):**
+• وب (Django/Flask)
+• دیتا (Pandas/NumPy)
+• API (FastAPI)
+• تست (pytest)
+
+**منابع رایگان:**
+• python.org
+• realpython.com
+• w3schools.com/python
+"""
+    await update.message.reply_text(roadmap)
+
+async def interview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """سوالات مصاحبه برنامه‌نویسی"""
+    questions = [
+        "❓ تفاوت بین == و is در پایتون چیست؟",
+        "❓ REST API چیست و چه اصولی دارد؟",
+        "❓ تفاوت Git merge و rebase چیست؟",
+        "❓ HTTP Status Code 404 یعنی چه؟",
+        "❓ Docker و تفاوت آن با ماشین مجازی چیست؟",
+        "❓ NoSQL و SQL چه تفاوت‌هایی دارند؟",
+        "❓ GIL در پایتون چیست؟",
+        "❓ تفاوت بین list و tuple در پایتون؟",
+    ]
+    question = random.choice(questions)
+    await update.message.reply_text(question)
+
+async def coding_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """چالش روزانه کدنویسی"""
+    challenges = [
+        "💻 **چالش امروز:**\nبرنامه‌ای بنویسید که اعداد اول بین 1 تا 100 را چاپ کند.",
+        "💻 **چالش امروز:**\nبرنامه‌ای بنویسید که یک رشته را معکوس کند (بدون استفاده از reverse).",
+        "💻 **چالش امروز:**\nتابعی بنویسید که یک عدد را بگیرد و فاکتوریل آن را محاسبه کند.",
+        "💻 **چالش امروز:**\nبرنامه‌ای بنویسید که یک آرایه را مرتب کند (بدون sort).",
+    ]
+    challenge = random.choice(challenges)
+    await update.message.reply_text(challenge)
+
+# ========== ابزارهای کاربردی ==========
+async def timestamp_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل Timestamp به تاریخ و بالعکس"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً timestamp یا تاریخ را وارد کنید!\n"
+            "مثال: /timestamp 1704067200\n"
+            "مثال: /timestamp 2024-01-01"
+        )
+        return
+    
+    input_value = context.args[0]
+    
+    if input_value.isdigit():
+        # Timestamp به تاریخ
+        dt = datetime.fromtimestamp(int(input_value))
+        result = f"📅 **تاریخ:** {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+    else:
+        # تاریخ به timestamp
         try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=i)
-            count += 1
+            dt = datetime.strptime(input_value, '%Y-%m-%d')
+            timestamp = int(dt.timestamp())
+            result = f"⏱️ **Timestamp:** {timestamp}"
         except:
-            pass
+            result = "❌ فرمت نامعتبر! استفاده کنید: YYYY-MM-DD"
     
-    msg = await update.message.reply_text(f"🧹 {count} پیام پاک شد!")
-    await asyncio.sleep(3)
-    await msg.delete()
+    await update.message.reply_text(result)
 
-# ========== تنظیمات قفل ==========
-
-async def locklink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global link_locked
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
+async function color_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تبدیل رنگ Hex به RGB و بالعکس"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ لطفاً رنگ را وارد کنید!\n"
+            "مثال: /color #FF5733\n"
+            "مثال: /color rgb(255, 87, 51)"
+        )
         return
-    link_locked = True
-    await update.message.reply_text("🔒 لینک قفل شد! کاربران عادی نمیتوانند لینک بفرستند.")
-
-async def unlocklink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global link_locked
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    link_locked = False
-    await update.message.reply_text("🔓 قفل لینک برداشته شد.")
-
-async def lockforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global forward_locked
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    forward_locked = True
-    await update.message.reply_text("🔒 فوروارد قفل شد!")
-
-async def unlockforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global forward_locked
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    forward_locked = False
-    await update.message.reply_text("🔓 فوروارد آزاد شد!")
-
-async def slowmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global slow_mode, slow_mode_seconds
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
-        return
-    args = context.args
-    if args and args[0].isdigit():
-        slow_mode_seconds = int(args[0])
-        slow_mode = True
-        await update.message.reply_text(f"🐢 حالت آهسته فعال شد! هر {slow_mode_seconds} ثانیه یک پیام")
+    
+    color_input = context.args[0]
+    
+    if color_input.startswith('#'):
+        # Hex to RGB
+        hex_color = color_input.lstrip('#')
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        result = f"🎨 **RGB:** rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
+    elif color_input.startswith('rgb'):
+        # RGB to Hex
+        import re
+        numbers = re.findall(r'\d+', color_input)
+        if len(numbers) == 3:
+            hex_color = '#{:02x}{:02x}{:02x}'.format(int(numbers[0]), int(numbers[1]), int(numbers[2]))
+            result = f"🎨 **Hex:** {hex_color}"
+        else:
+            result = "❌ فرمت RGB نامعتبر!"
     else:
-        slow_mode = False
-        await update.message.reply_text("🐢 حالت آهسته غیرفعال شد!")
+        result = "❌ فرمت نامعتبر! استفاده کنید: #RRGGBB یا rgb(r,g,b)"
+    
+    await update.message.reply_text(result)
 
-async def setrules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global group_rules
-    if not update.effective_chat.get_member(update.effective_user.id).is_chat_admin():
-        await update.message.reply_text("❌ فقط ادمین‌ها!")
+async def password_generator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ساخت رمز عبور قوی"""
+    import string
+    length = int(context.args[0]) if context.args and context.args[0].isdigit() else 16
+    
+    characters = string.ascii_letters + string.digits + string.punctuation
+    password = ''.join(random.choice(characters) for _ in range(length))
+    
+    await update.message.reply_text(f"🔐 **رمز عبور پیشنهادی ({length} کاراکتر):**\n`{password}`", parse_mode="Markdown")
+
+async def jwt_decoder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دیکد کردن JWT"""
+    if not context.args:
+        await update.message.reply_text("⚠️ لطفاً JWT token را وارد کنید!\nمثال: /jwt eyJhbGciOiJIUzI1NiIs...")
         return
-    args = context.args
-    if args:
-        group_rules = " ".join(args)
-        await update.message.reply_text(f"✅ قوانین گروه به‌روزرسانی شد!\n\n{group_rules}")
-    else:
-        await update.message.reply_text("⚠️ لطفاً قوانین جدید را وارد کنید!\nمثال: /setrules قانون 1 - قانون 2")
+    
+    jwt_token = context.args[0]
+    try:
+        import base64
+        # دیکد بخش payload
+        parts = jwt_token.split('.')
+        if len(parts) >= 2:
+            payload = base64.b64decode(parts[1] + '==').decode()
+            await update.message.reply_text(f"🔓 **JWT Payload:**\n```json\n{json.dumps(json.loads(payload), indent=2)}\n```", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ JWT نامعتبر!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {str(e)}")
 
-async def getrules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(group_rules, parse_mode="Markdown")
-
-# ========== دستورات عمومی ==========
-
+# ========== دستورات اصلی ربات ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور شروع با منوی کامل"""
     keyboard = [
-        [InlineKeyboardButton("📊 آمار گروه", callback_data="stats")],
-        [InlineKeyboardButton("📈 رنک من", callback_data="rank")],
-        [InlineKeyboardButton("📋 قوانین", callback_data="rules")],
-        [InlineKeyboardButton("🎁 قرعه‌کشی", callback_data="lottery")],
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
+        [InlineKeyboardButton("💻 اجرای کد", callback_data="run_code")],
+        [InlineKeyboardButton("🔧 ابزارهای کد", callback_data="code_tools")],
+        [InlineKeyboardButton("🔐 رمزنگاری", callback_data="crypto")],
+        [InlineKeyboardButton("🗄️ دیتابیس", callback_data="database")],
+        [InlineKeyboardButton("🐳 Docker", callback_data="docker")],
+        [InlineKeyboardButton("📚 آموزش", callback_data="learning")],
+        [InlineKeyboardButton("🛠️ ابزارهای کاربردی", callback_data="utils")],
+        [InlineKeyboardButton("❓ راهنما", callback_data="help_menu")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "🤖 **ربات اَبَرمدیریت گروه NAQD**\n\n"
-        "به ربات قدرتمند مدیریت گروه خوش آمدید!\n"
-        "با استفاده از دکمه‌های زیر از امکانات ربات استفاده کنید:\n\n"
-        "**نسخه:** 3.0.0 | **توسعه‌دهنده:** @AMIRSAMDERAKHSHAN",
+        "🤖 **ربات حرفه‌ای برنامه‌نویسان**\n\n"
+        "به بزرگترین ربات تخصصی برنامه‌نویسی خوش آمدید!\n"
+        "**110+ قابلیت** برای کمک به توسعه‌دهندگان\n\n"
+        "🔹 اجرای کد در 6 زبان مختلف\n"
+        "🔹 ابزارهای JSON، XML، Regex\n"
+        "🔹 رمزنگاری و هش کردن\n"
+        "🔹 تولید Dockerfile و Gitignore\n"
+        "🔹 سوالات مصاحبه و چالش کدنویسی\n"
+        "🔹 و ده‌ها ابزار کاربردی دیگر\n\n"
+        "از منوی زیر استفاده کنید یا دستور /help را بفرستید.\n\n"
+        "**توسعه‌دهنده:** @AMIRSAMDERAKHSHAN",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    member_count = await context.bot.get_chat_member_count(chat.id)
-    admins = await context.bot.get_chat_administrators(chat.id)
-    
-    total_msgs = sum(user_messages.values())
-    active_users = len([v for v in user_messages.values() if v > 0])
-    
-    await update.message.reply_text(
-        f"📊 **آمار گروه {chat.title}**\n\n"
-        f"👥 کل اعضا: {member_count}\n"
-        f"👑 تعداد ادمین‌ها: {len(admins)}\n"
-        f"💬 کل پیام‌ها: {total_msgs}\n"
-        f"⭐ کاربران فعال: {active_users}\n"
-        f"🔇 سکوت شده‌ها: {len(muted_until)}\n"
-        f"⛔ موقت بن‌ها: {len(temp_bans)}\n"
-        f"🔒 وضعیت قفل لینک: {'فعال' if link_locked else 'غیرفعال'}\n"
-        f"🔒 وضعیت قفل فوروارد: {'فعال' if forward_locked else 'غیرفعال'}\n"
-        f"🐢 حالت آهسته: {'فعال' if slow_mode else 'غیرفعال'}",
-        parse_mode="Markdown"
-    )
-
-async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    msg_count = user_messages[user_id]
-    points = user_points[user_id]
-    
-    level = "🌱 تازه‌وارد"
-    for required, title in sorted(RANKS.items()):
-        if msg_count >= required:
-            level = title
-    
-    next_rank = _get_next_rank(msg_count)
-    
-    await update.message.reply_text(
-        f"📈 **کارت شما**\n\n"
-        f"👤 نام: {update.effective_user.first_name}\n"
-        f"🏆 سطح: {level}\n"
-        f"📨 پیام‌ها: {msg_count}\n"
-        f"⭐ امتیاز: {points}\n"
-        f"⚠️ اخطارها: {user_warns.get(user_id, 0)}/{warn_limit}\n"
-        f"🎯 تا سطح بعدی: {next_rank} پیام",
-        parse_mode="Markdown"
-    )
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not user_messages:
-        await update.message.reply_text("📊 هنوز آماری ثبت نشده!")
-        return
-    
-    sorted_users = sorted(user_messages.items(), key=lambda x: x[1], reverse=True)[:10]
-    leaderboard_text = "🏆 **جدول برترین‌ها** 🏆\n\n"
-    
-    for i, (user_id, count) in enumerate(sorted_users, 1):
-        try:
-            user = await context.bot.get_chat(user_id)
-            name = user.first_name
-            leaderboard_text += f"{i}. {name}: {count} پیام\n"
-        except:
-            leaderboard_text += f"{i}. کاربر ناشناس: {count} پیام\n"
-    
-    await update.message.reply_text(leaderboard_text, parse_mode="Markdown")
-
-async def lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """قرعه‌کشی روزانه"""
-    user_id = update.effective_user.id
-    today = datetime.now().date()
-    
-    if user_joins.get(user_id) == today:
-        await update.message.reply_text("🎲 شما امروز قبلاً در قرعه‌کشی شرکت کردید! فردا دوباره امتحان کنید.")
-        return
-    
-    user_joins[user_id] = today
-    prize = random.randint(1, 50)
-    user_points[user_id] += prize
-    
-    await update.message.reply_text(
-        f"🎉 **تبریک!** 🎉\n\n"
-        f"شما در قرعه‌کشی روزانه برنده شدید!\n"
-        f"🎁 جایزه شما: {prize} امتیاز\n"
-        f"⭐ امتیاز کل شما: {user_points[user_id]}"
-    )
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 **راهنمای کامل ربات**\n\n"
-        "**دستورات عمومی:**\n"
-        "/start - شروع به کار\n"
-        "/stats - آمار گروه\n"
-        "/rank - کارت شما\n"
-        "/leaderboard - جدول برترین‌ها\n"
-        "/lottery - قرعه‌کشی روزانه\n"
-        "/rules - مشاهده قوانین\n"
-        "/info - اطلاعات کاربر\n\n"
-        "**دستورات ادمین (با ریپلی):**\n"
-        "/mute [دقیقه] - سکوت کاربر\n"
-        "/unmute - برداشتن سکوت\n"
-        "/ban - بن دائم\n"
-        "/tempban [دقیقه] - بن موقت\n"
-        "/warn - اخطار\n"
-        "/clear - پاک کردن پیام‌ها\n\n"
-        "**تنظیمات ادمین:**\n"
-        "/locklink - قفل لینک\n"
-        "/unlocklink - باز کردن قفل لینک\n"
-        "/lockforward - قفل فوروارد\n"
-        "/unlockforward - باز کردن قفل فوروارد\n"
-        "/slowmode [ثانیه] - حالت آهسته\n"
-        "/setrules [قوانین] - تنظیم قوانین\n"
-        "/getrules - مشاهده قوانین",
-        parse_mode="Markdown"
-    )
+    """راهنمای کامل"""
+    help_text = """
+🤖 **راهنمای کامل ربات برنامه‌نویسان**
 
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(group_rules, parse_mode="Markdown")
+**💻 اجرای کد:**
+/run [language] [code] - اجرای کد (python, js, go)
 
-async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
-    user_id = target.id
-    
-    msg_count = user_messages[user_id]
-    warns = user_warns.get(user_id, 0)
-    points = user_points[user_id]
-    
-    status = "در حال چت"
-    if user_id in muted_until:
-        status = f"سکوت شده تا {muted_until[user_id].strftime('%H:%M')}"
-    elif user_id in temp_bans:
-        status = f"بن موقت تا {temp_bans[user_id].strftime('%H:%M')}"
-    
-    await update.message.reply_text(
-        f"ℹ️ **اطلاعات کاربر**\n\n"
-        f"👤 نام: {target.first_name}\n"
-        f"🆔 آیدی: `{user_id}`\n"
-        f"📊 وضعیت: {status}\n"
-        f"📨 پیام‌ها: {msg_count}\n"
-        f"⚠️ اخطارها: {warns}/{warn_limit}\n"
-        f"⭐ امتیاز: {points}",
-        parse_mode="Markdown"
-    )
+**🔧 ابزارهای کد:**
+/format - فرمت کردن کد
+/minify - کوچک‌سازی کد
+/explain - توضیح کد
 
-# ========== هندلرهای خودکار ==========
+**🔐 رمزنگاری:**
+/encode [text] - تبدیل به Base64
+/decode [base64] - تبدیل از Base64
+/hash [md5|sha1|sha256] [text] - ساخت هش
+/uuid - ساخت UUID جدید
 
-async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for new_member in update.message.new_chat_members:
-        if new_member.id == context.bot.id:
-            await update.message.reply_text(
-                "🤖 **ربات اَبَرمدیریت با موفقیت فعال شد!**\n\n"
-                f"قوانین گروه:\n{group_rules}\n\n"
-                "از دستور /help برای دیدن امکانات استفاده کنید.",
-                parse_mode="Markdown"
-            )
-        else:
-            keyboard = [[InlineKeyboardButton("📋 قوانین", callback_data="rules")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                f"✨ **به گروه خوش آمدید {new_member.first_name}!** ✨\n\n"
-                f"📋 لطفاً قوانین گروه را مطالعه کنید.\n"
-                f"💬 برای شروع از دستور /help استفاده کنید.\n"
-                f"🎁 هر روز در قرعه‌کشی شرکت کنید!",
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
+**🗄️ دیتابیس:**
+/sql [table] - تولید SQL query
 
-async def left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.left_chat_member:
-        user = update.message.left_chat_member
-        await update.message.reply_text(f"👋 {user.first_name} از گروه خارج شد! خدا حافظ.")
+**🐳 Docker:**
+/dockerfile [lang] - تولید Dockerfile
 
-async def anti_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    
-    user_id = update.effective_user.id
-    current_time = datetime.now().timestamp()
-    
-    # Slow mode
-    if slow_mode:
-        last_time = last_message_time.get(user_id, 0)
-        if current_time - last_time < slow_mode_seconds:
-            await update.message.delete()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🐢 {update.effective_user.first_name} جان! لطفاً {slow_mode_seconds} ثانیه صبر کن!",
-                reply_to_message_id=update.message.message_id
-            )
-            return
-        last_message_time[user_id] = current_time
-    
-    # Anti-flood (تکرار سریع)
-    message_count[user_id] += 1
-    
-    if message_count[user_id] > 5:
-        if anti_spam_count[user_id] >= 2:
-            await context.bot.restrict_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=user_id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=datetime.now() + timedelta(minutes=5)
-            )
-            await update.message.reply_text(f"🚫 {update.effective_user.first_name} به دلیل اسپم شدید 5 دقیقه سکوت شد!")
-            message_count[user_id] = 0
-            anti_spam_count[user_id] = 0
-        else:
-            await update.message.reply_text(f"⚠️ {update.effective_user.first_name} از اسپم خودداری کن!")
-            anti_spam_count[user_id] += 1
-            message_count[user_id] = 0
-    else:
-        # Reset counter after 5 seconds
-        asyncio.create_task(reset_counter(user_id))
-    
-    # به‌روزرسانی آمار
-    user_messages[user_id] += 1
-    user_points[user_id] += 1
+**📚 آموزش:**
+/python - راهنمای یادگیری پایتون
+/interview - سوالات مصاحبه
+/challenge - چالش روزانه
 
-async def reset_counter(user_id):
-    await asyncio.sleep(5)
-    if user_id in message_count:
-        message_count[user_id] = max(0, message_count[user_id] - 1)
+**🛠️ ابزارهای کاربردی:**
+/timestamp [time] - تبدیل تایم‌استمپ
+/color [color] - تبدیل رنگ
+/password [length] - ساخت رمز عبور
+/jwt [token] - دیکد JWT
+/git [command] - راهنمای Git
 
-async def filter_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global link_locked
-    
-    if not update.message or not update.message.text:
-        return
-    
-    if link_locked:
-        user = update.effective_user
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
-        
-        if not chat_member.is_chat_admin:
-            link_pattern = r'(https?://|www\.|@|t\.me/|\.com|\.ir|\.org|\.net)'
-            if re.search(link_pattern, update.message.text, re.IGNORECASE):
-                await update.message.delete()
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"🔗 {user.first_name} جان! ارسال لینک در گروه ممنوع است!",
-                    reply_to_message_id=update.message.message_id
-                )
+**📡 API و وب:**
+/status [code] - HTTP status codes
+/curl - تبدیل CURL به کد
 
-async def filter_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global forward_locked
-    
-    if forward_locked and update.message.forward_from:
-        user = update.effective_user
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user.id)
-        
-        if not chat_member.is_chat_admin:
-            await update.message.delete()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🚫 {user.first_name} جان! فوروارد پیام در گروه ممنوع است!",
-                reply_to_message_id=update.message.message_id
-            )
+**🎲 سرگرمی:**
+/lottery - قرعه‌کشی روزانه
+/rank - نمایش سطح شما
+"""
+    await update.message.reply_text(help_text)
 
-async def filter_bad_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    
-    for word in bad_words:
-        if word.lower() in update.message.text.lower():
-            await update.message.delete()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🚫 {update.effective_user.first_name} جان! از کلمات نامناسب استفاده نکنید!",
-                reply_to_message_id=update.message.message_id
-            )
-            return
-
-async def auto_responses_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    
-    text = update.message.text.strip().lower()
-    for key, response in auto_responses.items():
-        if key in text:
-            await update.message.reply_text(response)
-            break
-
-async def track_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ردیابی همه پیام‌ها برای آمار"""
-    if update.message and update.message.text and not update.message.text.startswith('/'):
-        user_messages[update.effective_user.id] += 1
-
-# ========== Callback handlers ==========
+# ========== Callback Handlers ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "stats":
-        await stats(query.message, context)
-    elif query.data == "rank":
-        await rank(query.message, context)
-    elif query.data == "rules":
-        await rules(query.message, context)
-    elif query.data == "lottery":
-        await lottery(query.message, context)
-    elif query.data == "help":
+    if query.data == "run_code":
+        await query.message.reply_text("💻 برای اجرای کد از دستور /run استفاده کنید\nمثال: /run python print('Hello')")
+    elif query.data == "code_tools":
+        await query.message.reply_text("🔧 ابزارهای کد:\n/format - فرمت\n/minify - کوچک‌سازی\n/explain - توضیح")
+    elif query.data == "crypto":
+        await query.message.reply_text("🔐 ابزارهای رمزنگاری:\n/encode\n/decode\n/hash\n/uuid")
+    elif query.data == "database":
+        await query.message.reply_text("🗄️ ابزارهای دیتابیس:\n/sql - تولید SQL")
+    elif query.data == "docker":
+        await query.message.reply_text("🐳 ابزارهای Docker:\n/dockerfile - تولید Dockerfile")
+    elif query.data == "learning":
+        await query.message.reply_text("📚 آموزش:\n/python\n/interview\n/challenge")
+    elif query.data == "utils":
+        await query.message.reply_text("🛠️ ابزارها:\n/timestamp\n/color\n/password\n/jwt\n/git")
+    elif query.data == "help_menu":
         await help_command(query.message, context)
-
-# ========== تابع کمکی ==========
-def _get_next_rank(current_msgs):
-    for required, _ in sorted(RANKS.items()):
-        if current_msgs < required:
-            return required - current_msgs
-    return 0
 
 # ========== اجرای اصلی ==========
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TOKEN).build()
     
-    # دستورات ادمین
-    application.add_handler(CommandHandler('mute', mute))
-    application.add_handler(CommandHandler('unmute', unmute))
-    application.add_handler(CommandHandler('ban', ban))
-    application.add_handler(CommandHandler('tempban', temp_ban))
-    application.add_handler(CommandHandler('warn', warn))
-    application.add_handler(CommandHandler('clear', clear))
-    application.add_handler(CommandHandler('locklink', locklink))
-    application.add_handler(CommandHandler('unlocklink', unlocklink))
-    application.add_handler(CommandHandler('lockforward', lockforward))
-    application.add_handler(CommandHandler('unlockforward', unlockforward))
-    application.add_handler(CommandHandler('slowmode', slowmode))
-    application.add_handler(CommandHandler('setrules', setrules))
-    application.add_handler(CommandHandler('getrules', getrules))
-    
-    # دستورات عمومی
+    # دستورات اصلی
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('stats', stats))
-    application.add_handler(CommandHandler('rank', rank))
-    application.add_handler(CommandHandler('leaderboard', leaderboard))
-    application.add_handler(CommandHandler('lottery', lottery))
     application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('rules', rules))
-    application.add_handler(CommandHandler('info', userinfo))
     
-    # Callback handlers
+    # ابزارهای کد
+    application.add_handler(CommandHandler('run', run_code))
+    application.add_handler(CommandHandler('format', format_code))
+    application.add_handler(CommandHandler('minify', minify_code))
+    application.add_handler(CommandHandler('explain', explain_code))
+    
+    # ابزارهای دیتا
+    application.add_handler(CommandHandler('json2xml', json_to_xml))
+    application.add_handler(CommandHandler('xml2json', xml_to_json))
+    
+    # رمزنگاری
+    application.add_handler(CommandHandler('encode', encode_base64))
+    application.add_handler(CommandHandler('decode', decode_base64))
+    application.add_handler(CommandHandler('hash', hash_text))
+    application.add_handler(CommandHandler('uuid', generate_uuid))
+    
+    # Regex
+    application.add_handler(CommandHandler('regex', regex_test))
+    application.add_handler(CommandHandler('regexhelp', regex_help))
+    
+    # API و وب
+    application.add_handler(CommandHandler('status', http_status))
+    application.add_handler(CommandHandler('curl', curl_to_code))
+    
+    # دیتابیس
+    application.add_handler(CommandHandler('sql', generate_sql))
+    
+    # Git
+    application.add_handler(CommandHandler('git', git_help))
+    application.add_handler(CommandHandler('gitignore', generate_gitignore))
+    
+    # Docker
+    application.add_handler(CommandHandler('dockerfile', generate_dockerfile))
+    
+    # آموزش
+    application.add_handler(CommandHandler('python', python_roadmap))
+    application.add_handler(CommandHandler('interview', interview_question))
+    application.add_handler(CommandHandler('challenge', coding_challenge))
+    
+    # ابزارهای کاربردی
+    application.add_handler(CommandHandler('timestamp', timestamp_convert))
+    application.add_handler(CommandHandler('color', color_convert))
+    application.add_handler(CommandHandler('password', password_generator))
+    application.add_handler(CommandHandler('jwt', jwt_decoder))
+    
+    # سرگرمی
+    application.add_handler(CommandHandler('lottery', lottery))
+    application.add_handler(CommandHandler('rank', rank))
+    application.add_handler(CommandHandler('stats', stats))
+    application.add_handler(CommandHandler('leaderboard', leaderboard))
+    
+    # Callback
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # هندلرهای خودکار
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
-    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, left_member))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, anti_spam))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, filter_links))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, filter_forward))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, filter_bad_words))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_responses_handler))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_all_messages))
     
     # اجرا با Polling
     application.run_polling()
